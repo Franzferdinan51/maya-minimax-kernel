@@ -17,13 +17,15 @@ Two dispatches per MoE layer replace the whole block:
 
 ## Model geometry (from the GGUF)
 
-60 layers (3 dense lead, 57 MoE), hidden 6144, expert FF 3072, 128 experts, top-4, IQ1_S experts (256-value blocks, 50-byte blocks), swiglu_oai alpha 1.702 / limit 7.0.
+60 layers (3 dense lead, 57 MoE), hidden 6144, expert FF 3072, 128 experts, top-4, swiglu_oai alpha 1.702 / limit 7.0. Experts are **not** one format: the pack mixes IQ1_S (50 B / 256 values) with per-layer IQ2_XXS bumps (66 B / 256) on the sensitive matrices — gate/up/down can differ within a single layer, and the kernels cover every pairing.
 
-## Status
+## Status (2026-11-20)
 
-- v1 kernel written, compiles clean as a standalone Metal object against the pinned ggml headers (`dequantize_iq1_s` reused as-is).
-- In progress: the ggml op plumbing (new op through ggml core + ggml-metal dispatch), parity verification against the synthetic fixture / numpy oracle, first real-model bench vs the 19.65 tok/s baseline.
-- Integration route: a `third_party/ggml/metal-mm3-fused-moe.patch` in project-maya, applied by `cmake/metal_backend.cmake` like the existing Metal patches, developed on the `minimax-metal` branch.
+- **Parity: PASS.** Synthetic-fixture test vs the numpy oracle: prompt logits rel L2 4.2e-05, greedy continuation bitwise-identical. On the real model, fused vs stock continuations agree for 14 tokens then split at a single greedy flip — the signature of FP32 reduction-order drift, not a dequant error (a wrong LUT flips token 0).
+- **Coverage: all 57 MoE layers fused.** v1 spoke only IQ1_S and crashed on the pack's IQ2_XXS layers; the kernels are now templated over both formats with mixed gate/up pairings (`moe_mm3.metal`), with matching CPU reference forwards.
+- **Speed: at par, not yet faster.** Real-model decode: fused 19.28 tok/s vs stock 19.86 tok/s (same harness, same prompt). A threadgroup-memory staging variant (v3) regressed to 18.67 and was reverted. The two-kernel split alone does not beat ggml's tuned `mul_mat_id` chain — see `PRIOR-ART.md` for what the literature says about where the remaining time lives (dispatch latency across the whole layer; dequant compute).
+- Full ggml integration patch: `ggml-mm3-fused.patch` (ops, Metal dispatch, CPU forwards, kernel). Developed on project-maya's `minimax-metal` branch.
+- Next: shared-expert fold-in, batched (verify-window) variants for the DSpark serve path, per-section GPU profiling.
 
 See `DESIGN.md` for the full profile findings and kernel plan.
 
