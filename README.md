@@ -19,15 +19,32 @@ Two dispatches per MoE layer replace the whole block:
 
 60 layers (3 dense lead, 57 MoE), hidden 6144, expert FF 3072, 128 experts, top-4, swiglu_oai alpha 1.702 / limit 7.0. Experts are **not** one format: the pack mixes IQ1_S (50 B / 256 values) with per-layer IQ2_XXS bumps (66 B / 256) on the sensitive matrices — gate/up/down can differ within a single layer, and the kernels cover every pairing.
 
-## Status (2026-11-20)
+## Status (2026-11-20, late)
 
-- **Parity: PASS.** Synthetic-fixture test vs the numpy oracle: prompt logits rel L2 4.2e-05, greedy continuation bitwise-identical. On the real model, fused vs stock continuations agree for 14 tokens then split at a single greedy flip — the signature of FP32 reduction-order drift, not a dequant error (a wrong LUT flips token 0).
-- **Coverage: all 57 MoE layers fused.** v1 spoke only IQ1_S and crashed on the pack's IQ2_XXS layers; the kernels are now templated over both formats with mixed gate/up pairings (`moe_mm3.metal`), with matching CPU reference forwards.
-- **Speed: at par, not yet faster.** Real-model decode: fused 19.28 tok/s vs stock 19.86 tok/s (same harness, same prompt). A threadgroup-memory staging variant (v3) regressed to 18.67 and was reverted. The two-kernel split alone does not beat ggml's tuned `mul_mat_id` chain — see `PRIOR-ART.md` for what the literature says about where the remaining time lives (dispatch latency across the whole layer; dequant compute).
-- Full ggml integration patch: `ggml-mm3-fused.patch` (ops, Metal dispatch, CPU forwards, kernel). Developed on project-maya's `minimax-metal` branch.
-- Next: shared-expert fold-in, batched (verify-window) variants for the DSpark serve path, per-section GPU profiling.
+Correct and fully general, at par on plain decode, BEHIND on speculative serve.
+The gap is understood and the next kernel revision is scoped (below).
 
-See `DESIGN.md` for the full profile findings and kernel plan.
+- Parity: F32 fixture PASS (prompt rel L2 4.24e-05, sliced prompt 4.234e-05,
+  greedy continuation bitwise). The engine's divergence harness verdict:
+  A-consistent - the batched verify path is token-exact under forced
+  rejections; batched-vs-single logits differ only at the 6.2e-05 batching
+  scale. All 57 MoE layers fuse (mixed IQ1_S/IQ2_XXS included).
+- Batched verify windows: the fused ops now take T rows (decode T=1, DSpark
+  verify windows, prompt slices up to T=32; larger prefill slices keep
+  ggml's batched mul_mm path, which is faster there).
+- Plain decode, same harness/prompt: fused 19.34 tok/s vs stock 19.86.
+- Speculative serve (counting prompt, 256 tokens, DSpark on): fused 39.33
+  tok/s vs stock 43.94. The fused window kernel LOSES ~11% here: it
+  re-dequantizes each expert row once per token row, while ggml's
+  mul_mat_id amortizes dequant across the window.
+- Next revision (scoped, not built): expert-major window kernel - grid over
+  (expert, row-block), each weight tile dequantized once and reused across
+  every window row that selected the expert. That is the remaining
+  structural gap to close; the two-kernel fusion itself is at parity.
+- Physical bound for this pack: ~7.2 GB of weights move per token
+  (lm_head ~1.0 GB, shared experts ~2.2 GB, routed ~2.5 GB at top-4), so
+  single-token decode caps near bandwidth; 50-100+ tok/s runs through
+  speculation yield, not through the plain path.
 
 ## Credits
 
