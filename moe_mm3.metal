@@ -241,3 +241,148 @@ kernel void kernel_moe_mm3_down_sum_f32(
         out[row] = acc;
     }
 }
+
+// ---- expert-major window variant (T > 1), appended 2026-11-21 ----
+//
+// Same math and the same per-lane accumulation order as the token-major
+// kernels above, so results are bitwise identical; only the grid changes.
+// Token-major launches one simdgroup per (token, slot, row) and therefore
+// re-dequantizes an expert's row once per token row that selected it.
+// Expert-major launches one simdgroup per (expert, row): the row is
+// dequantized ONCE into registers (in step chunks) and reused for every
+// window slot that selected the expert — the amortization ggml's
+// mul_mat_id gets from its grouped layout. Selected by the host op when
+// 1 < T and T*k <= MOE_MM3_EM_MAXSLOTS (the engine gate already caps
+// T <= 32); T == 1 keeps the token-major kernels, and n_ff % 8 == 0 is a
+// dispatch precondition (threadgroups never straddle an expert boundary).
+
+#define MOE_MM3_EM_MAXSLOTS 128
+#define MOE_MM3_EM_CS 2
+
+struct moe_mm3_block_f32 { float v[256]; };
+
+static inline void moe_mm3_dequant(device const moe_mm3_block_f32 * xb, short il, thread float4x4 & reg) {
+    device const float * v = xb->v + (int)il * 16;
+    reg = float4x4(float4(v[0],  v[1],  v[2],  v[3]),
+                   float4(v[4],  v[5],  v[6],  v[7]),
+                   float4(v[8],  v[9],  v[10], v[11]),
+                   float4(v[12], v[13], v[14], v[15]));
+}
+
+static inline float moe_mm3_dot16(thread const float4x4 & reg, device const float * xv) {
+    return reg[0][0] * xv[0]  + reg[0][1] * xv[1]  + reg[0][2] * xv[2]  + reg[0][3] * xv[3]
+         + reg[1][0] * xv[4]  + reg[1][1] * xv[5]  + reg[1][2] * xv[6]  + reg[1][3] * xv[7]
+         + reg[2][0] * xv[8]  + reg[2][1] * xv[9]  + reg[2][2] * xv[10] + reg[2][3] * xv[11]
+         + reg[3][0] * xv[12] + reg[3][1] * xv[13] + reg[3][2] * xv[14] + reg[3][3] * xv[15];
+}
+
+template <typename gblock_t, typename ublock_t>
+static void moe_mm3_gu_em_impl(
+        constant moe_mm3_args & args,
+        device const float * x,          // [T, n_embd]
+        device const char * gate_w,
+        device const char * up_w,
+        device const int32_t * ids,      // flat slots [T*k]
+        device float * hh,               // [T, k, n_ff]
+        uint tgpig_x, uint simd_gid, uint lane, uint tid_in_tg,
+        threadgroup int32_t * tg_flag,
+        threadgroup int32_t * tg_slot,
+        threadgroup int32_t * tg_count) {
+    const int row = (int)(tgpig_x * 8 + simd_gid);
+    const int r = row % args.n_ff;
+    const int expert = row / args.n_ff;
+    const int slots = args.n_tokens * args.k;
+
+    // match scan, once per threadgroup: all 8 simdgroups share this expert
+    if (tid_in_tg == 0) tg_count[0] = 0;
+    if ((int)tid_in_tg < slots) tg_flag[tid_in_tg] = (ids[tid_in_tg] == expert) ? 1 : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid_in_tg == 0) {
+        int c = 0;
+        for (int j = 0; j < slots; ++j) {
+            if (tg_flag[j]) tg_slot[c++] = j;
+        }
+        tg_count[0] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int count = tg_count[0];
+    if (count == 0) return;
+
+    const int n_blocks = args.n_embd / 256;
+    const int steps = n_blocks * 16;
+    const int nb_grow = n_blocks * (int)sizeof(gblock_t);
+    const int nb_urow = n_blocks * (int)sizeof(ublock_t);
+    device const gblock_t * grow = (device const gblock_t *)(gate_w + (int64_t)expert * nb_grow * args.n_ff + r * nb_grow);
+    device const ublock_t * urow = (device const ublock_t *)(up_w   + (int64_t)expert * nb_urow * args.n_ff + r * nb_urow);
+
+    float pacc_g[MOE_MM3_EM_MAXSLOTS];
+    float pacc_u[MOE_MM3_EM_MAXSLOTS];
+    for (int j = 0; j < count; ++j) { pacc_g[j] = 0.0f; pacc_u[j] = 0.0f; }
+
+    // step chunks: dequantize MOE_MM3_EM_CS steps per lane into registers,
+    // then run every matching slot's x segment through those registers
+    // before dequantizing the next chunk. Per-lane step order stays
+    // ascending, exactly as in moe_mm3_dot_q.
+    for (int base = 0; base < steps; base += 32 * MOE_MM3_EM_CS) {
+        float4x4 greg[MOE_MM3_EM_CS];
+        float4x4 ureg[MOE_MM3_EM_CS];
+        int ss[MOE_MM3_EM_CS];
+        for (int i = 0; i < MOE_MM3_EM_CS; ++i) {
+            const int s = base + (int)lane + 32 * i;
+            ss[i] = s;
+            if (s < steps) {
+                moe_mm3_dequant(grow + s / 16, (short)(s % 16), greg[i]);
+                moe_mm3_dequant(urow + s / 16, (short)(s % 16), ureg[i]);
+            } else {
+                greg[i] = float4x4(0.0f);
+                ureg[i] = float4x4(0.0f);
+            }
+        }
+        for (int j = 0; j < count; ++j) {
+            const int t = tg_slot[j] / args.k;
+            device const float * xt = x + (int64_t)t * args.n_embd;
+            float sg = 0.0f, su = 0.0f;
+            for (int i = 0; i < MOE_MM3_EM_CS; ++i) {
+                const int s = ss[i];
+                if (s >= steps) break;
+                device const float * xv = xt + (s / 16) * 256 + (s % 16) * 16;
+                sg += moe_mm3_dot16(greg[i], xv);
+                su += moe_mm3_dot16(ureg[i], xv);
+            }
+            pacc_g[j] += sg;
+            pacc_u[j] += su;
+        }
+    }
+
+    for (int j = 0; j < count; ++j) {
+        const float g = simd_sum(pacc_g[j]);
+        const float u = simd_sum(pacc_u[j]);
+        if (lane == 0) {
+            hh[(int64_t)tg_slot[j] * args.n_ff + r] = moe_mm3_swiglu_oai(g, u, args.alpha, args.limit);
+        }
+    }
+}
+
+#define MOE_MM3_GU_EM_KERNEL(NAME, GT, UT) \
+kernel void NAME( \
+        constant moe_mm3_args & args, \
+        device const float * x, \
+        device const char * gate_w, \
+        device const char * up_w, \
+        device const int32_t * ids, \
+        device float * hh, \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        uint simd_gid [[simdgroup_index_in_threadgroup]], \
+        uint lane [[thread_index_in_simdgroup]], \
+        uint tid_in_tg [[thread_index_in_threadgroup]]) { \
+    threadgroup int32_t tg_flag[MOE_MM3_EM_MAXSLOTS]; \
+    threadgroup int32_t tg_slot[MOE_MM3_EM_MAXSLOTS]; \
+    threadgroup int32_t tg_count[1]; \
+    moe_mm3_gu_em_impl<GT, UT>(args, x, gate_w, up_w, ids, hh, tgpig.x, simd_gid, lane, tid_in_tg, tg_flag, tg_slot, tg_count); \
+}
+
+MOE_MM3_GU_EM_KERNEL(kernel_moe_mm3_gate_up_swiglu_em,         block_iq1_s,        block_iq1_s)
+MOE_MM3_GU_EM_KERNEL(kernel_moe_mm3_gate_up_swiglu_iq2_em,     block_iq2_xxs,      block_iq2_xxs)
+MOE_MM3_GU_EM_KERNEL(kernel_moe_mm3_gate_up_swiglu_iq2_iq1_em, block_iq2_xxs,      block_iq1_s)
+MOE_MM3_GU_EM_KERNEL(kernel_moe_mm3_gate_up_swiglu_iq1_iq2_em, block_iq1_s,        block_iq2_xxs)
+MOE_MM3_GU_EM_KERNEL(kernel_moe_mm3_gate_up_swiglu_f32_em,     moe_mm3_block_f32,  moe_mm3_block_f32)
