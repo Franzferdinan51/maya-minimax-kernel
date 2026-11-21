@@ -1,0 +1,116 @@
+--- /Volumes/Sabrent/project-maya/build-metal/_deps/maya_llamacpp-src/ggml/include/ggml.h	2026-11-01 17:18:09
++++ /Volumes/Sabrent/project-maya-minimax/build-metal/_deps/maya_llamacpp-src/ggml/include/ggml.h	2026-11-20 19:15:04
+@@ -524,6 +524,8 @@
+         GGML_OP_MUL_MAT,
+         GGML_OP_MUL_MAT_ID,
+         GGML_OP_OUT_PROD,
++        GGML_OP_MOE_MM3_GU,
++        GGML_OP_MOE_MM3_DOWN,
+ 
+         GGML_OP_SCALE,
+         GGML_OP_SET,
+@@ -1502,7 +1504,29 @@
+             struct ggml_tensor  * as,
+             struct ggml_tensor  * b,
+             struct ggml_tensor  * ids);
++
++    // MiniMax-M3.1 fused MoE (decode): gate+up matvec with swiglu_oai fused.
++    // gate/up: [n_embd, n_ff, n_exp] quantized; x: [n_embd, T]; ids: [k, T] i32.
++    // result: [n_ff, k, T] f32 hidden activations.
++    GGML_API struct ggml_tensor * ggml_moe_mm3_gu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * gate,
++            struct ggml_tensor  * up,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * ids,
++            float alpha,
++            float limit);
+ 
++    // MiniMax-M3.1 fused MoE (decode): down matvec with router-weighted sum.
++    // down: [n_ff, n_embd, n_exp] quantized; hh: [n_ff, k, T]; ids/wts: [k, T].
++    // result: [n_embd, T] f32.
++    GGML_API struct ggml_tensor * ggml_moe_mm3_down(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * down,
++            struct ggml_tensor  * hh,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * wts);
++
+     // A: m columns, n rows,
+     // B: p columns, n rows,
+     // result is m columns, p rows
+--- /Volumes/Sabrent/project-maya/build-metal/_deps/maya_llamacpp-src/ggml/src/ggml.c	2026-11-01 17:18:10
++++ /Volumes/Sabrent/project-maya-minimax/build-metal/_deps/maya_llamacpp-src/ggml/src/ggml.c	2026-11-20 19:15:04
+@@ -1023,6 +1023,8 @@
+     "MUL_MAT",
+     "MUL_MAT_ID",
+     "OUT_PROD",
++    "MOE_MM3_GU",
++    "MOE_MM3_DOWN",
+ 
+     "SCALE",
+     "SET",
+@@ -3410,7 +3412,63 @@
+     result->op     = GGML_OP_MUL_MAT_ID;
+     result->src[0] = as;
+     result->src[1] = b;
++    result->src[2] = ids;
++
++    return result;
++}
++
++// ggml_moe_mm3_gu / ggml_moe_mm3_down
++
++struct ggml_tensor * ggml_moe_mm3_gu(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * gate,
++        struct ggml_tensor  * up,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * ids,
++        float alpha,
++        float limit) {
++    GGML_ASSERT(!ggml_is_transposed(gate) && !ggml_is_transposed(up));
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    GGML_ASSERT(gate->ne[0] == x->ne[0]);          // n_embd
++    GGML_ASSERT(gate->ne[1] == up->ne[1]);         // n_ff
++    GGML_ASSERT(gate->ne[2] == up->ne[2]);         // n_exp
++    GGML_ASSERT(ids->ne[1] == x->ne[1]);           // one expert list per token
++
++    const int64_t ne[4] = { gate->ne[1], ids->ne[0], x->ne[1], 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    result->op     = GGML_OP_MOE_MM3_GU;
++    result->src[0] = gate;
++    result->src[1] = up;
++    result->src[2] = x;
++    result->src[3] = ids;
++    ((float *) result->op_params)[0] = alpha;
++    ((float *) result->op_params)[1] = limit;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_moe_mm3_down(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * down,
++        struct ggml_tensor  * hh,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * wts) {
++    GGML_ASSERT(!ggml_is_transposed(down));
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    GGML_ASSERT(wts->type == GGML_TYPE_F32);
++    GGML_ASSERT(down->ne[0] == hh->ne[0]);         // n_ff
++    GGML_ASSERT(hh->ne[1] == ids->ne[0]);          // k
++    GGML_ASSERT(wts->ne[0] == ids->ne[0] && wts->ne[1] == ids->ne[1]);
++
++    const int64_t ne[4] = { down->ne[1], hh->ne[2], 1, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    result->op     = GGML_OP_MOE_MM3_DOWN;
++    result->src[0] = down;
++    result->src[1] = hh;
+     result->src[2] = ids;
++    result->src[3] = wts;
+ 
+     return result;
+ }
